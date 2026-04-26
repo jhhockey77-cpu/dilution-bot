@@ -1,66 +1,139 @@
+"""
+MasterBot — dilution tracker for Discord
+Polygon.io (Massive plan) + SEC EDGAR
+
+Triggered by $TICKER mentions. Reports:
+  - Active ATM (S-3 + 424B5 + 8-K + sales agreement)
+  - Live S-3 shelf (with EFFECT verification)
+  - PIPE / Registered Direct (with dollar size)
+  - Recent 8-K offerings
+  - Warrants outstanding (with negation guard)
+  - Reverse splits
+  - Majority ownership (>50%) from 13D/G "Item 5" or DEF 14A beneficial-ownership tables
+  - China HQ flag
+  - Float / SI / DTC / short-vol-ratio
+  - Ticker history (prior tickers)
+"""
+
 import os, re, asyncio, aiohttp, discord
 from datetime import datetime, timedelta
 from html import unescape
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
 POLYGON_KEY   = "0NCwDp9jz7LfO6C0y0y4tKPRLvmH5mX1"
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 GUILD_ID      = 1497766198904094770
 TICKER_RE     = re.compile(r'\$([A-Za-z]{1,5})\b')
-SEC_HEADERS   = {"User-Agent": "DilutionBot jh.hockey77@gmail.com"}
+SEC_HEADERS   = {"User-Agent": "DilutionBot jh.hockey77@gmail.com",
+                 "Accept-Encoding": "gzip, deflate"}
+CHINA_CODES   = {"cn", "hk"}
+CHINA_DESC_RE = re.compile(
+    r"\b(?:PRC|People'?s\s+Republic\s+of\s+China|mainland\s+China|Hong\s+Kong|"
+    r"China[\s\-]based|based\s+in\s+China|incorporated\s+in\s+(?:the\s+)?Cayman\s+Islands.*?(?:operations?|subsidiar))\b",
+    re.I)
 
-CHINA_CODES = {"cn", "hk"}
+# SEC effectiveness window for an S-3 shelf
+SHELF_WINDOW_DAYS = 3 * 365 + 30   # 3 years + small grace
 
-# ── Pattern banks ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Form-name normalisation — EDGAR returns BOTH "SC 13D" and "SCHEDULE 13D"
+# ─────────────────────────────────────────────────────────────────────────────
+def _form_set(*names):
+    """Expand short and long names: SC 13D <-> SCHEDULE 13D, with /A variants."""
+    out = set()
+    for n in names:
+        out.add(n)
+        if n.startswith("SC "):
+            out.add("SCHEDULE " + n[3:])
+        elif n.startswith("SCHEDULE "):
+            out.add("SC " + n[9:])
+    return out
 
+ATM_PROSPECTUS_FORMS = _form_set("424B5", "424B3", "424B4", "S-3", "S-3/A", "S-3ASR", "POS AM")
+SHELF_FORMS          = _form_set("S-3", "S-3/A", "S-3ASR")
+PIPE_FORMS           = _form_set("424B3", "424B4", "424B5", "S-1", "S-1/A", "POS AM")
+OFFERING_8K_FORMS    = _form_set("8-K", "8-K/A")
+WARRANT_FORMS        = _form_set("424B3", "424B4", "424B5", "S-1", "S-1/A")
+SPLIT_FORMS          = _form_set("8-K", "8-K/A", "DEF 14A", "DEF 14C", "PRE 14A", "PRE 14C")
+OWNERSHIP_FORMS      = _form_set("SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A", "DEF 14A")
+EFFECT_FORMS         = {"EFFECT"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pattern banks
+# ─────────────────────────────────────────────────────────────────────────────
 ATM_PATTERNS = [
-    re.compile(r'at-the-market', re.I),
-    re.compile(r'\batm\s+offering', re.I),
-    re.compile(r'at the market offering', re.I),
-    re.compile(r'sales agreement', re.I),
-    re.compile(r'equity distribution agreement', re.I),
-    re.compile(r'controlled equity offering', re.I),
+    re.compile(r'at[\s\-]the[\s\-]market(?:\s+offering)?', re.I),
+    re.compile(r'\batm\s+(?:offering|program|sales)\b', re.I),
+    re.compile(r'sales\s+agreement', re.I),
+    re.compile(r'equity\s+distribution\s+agreement', re.I),
+    re.compile(r'controlled\s+equity\s+offering', re.I),
+    re.compile(r'open\s+market\s+sale\s+agreement', re.I),
+]
+ATM_TERMINATED_PATTERNS = [
+    re.compile(r'(?:terminated|expired|completed)\s+(?:the\s+)?(?:sales\s+agreement|atm|at[\s\-]the[\s\-]market)', re.I),
+    re.compile(r'(?:sales\s+agreement|atm)\s+(?:has\s+been\s+|was\s+)?(?:terminated|expired)', re.I),
+    re.compile(r'no\s+longer\s+(?:in\s+effect|active)', re.I),
 ]
 
 PIPE_PATTERNS = [
     re.compile(r'\bPIPE\b'),
-    re.compile(r'private investment in public equity', re.I),
-    re.compile(r'registered direct', re.I),
-    re.compile(r'private placement', re.I),
+    re.compile(r'private\s+investment\s+in\s+public\s+equity', re.I),
+    re.compile(r'registered\s+direct\s+offering', re.I),
+    re.compile(r'private\s+placement\s+(?:of|with|offering)', re.I),
+    re.compile(r'securities\s+purchase\s+agreement', re.I),
 ]
+# Anti-pattern: skip risk-factor / forward-looking language only
+PIPE_RISK_FACTOR_RE = re.compile(
+    r'(?:may|might|could|future)\s+(?:engage\s+in|conduct|complete|undertake)\s+(?:additional\s+)?'
+    r'(?:private\s+placements?|registered\s+direct|PIPE)', re.I)
 
 OFFERING_8K_PATTERNS = [
-    re.compile(r'public offering', re.I),
-    re.compile(r'underwritten offering', re.I),
-    re.compile(r'best efforts offering', re.I),
-    re.compile(r'registered direct offering', re.I),
-    re.compile(r'private placement', re.I),
+    re.compile(r'(?:underwritten|public|registered\s+direct|best[\s\-]efforts)\s+offering', re.I),
     re.compile(r'\bPIPE\b'),
+    re.compile(r'private\s+placement\s+(?:of|with)', re.I),
+    re.compile(r'securities\s+purchase\s+agreement', re.I),
+    re.compile(r'(?:closed|completed|priced)\s+(?:its|the|an?)\s+(?:public\s+)?offering', re.I),
+    re.compile(r'sales\s+agreement', re.I),
 ]
 
 WARRANT_PATTERNS = [
-    re.compile(r'warrant[s]?\s+to\s+purchase', re.I),
-    re.compile(r'([\d,]+(?:\.\d+)?)\s+warrant', re.I),
-    re.compile(r'warrant[s]?\s+exercisable', re.I),
-    re.compile(r'pre-funded\s+warrant', re.I),
+    re.compile(r'(?:pre[\s\-]funded|common|series\s+\w+)\s+warrant[s]?\b', re.I),
+    re.compile(r'warrant[s]?\s+to\s+purchase\s+(?:up\s+to\s+)?(?:[\d,]+|an\s+aggregate)', re.I),
+    re.compile(r'([\d,]+(?:\.\d+)?)\s+warrant[s]?\s+(?:exercisable|outstanding)', re.I),
+]
+WARRANT_NEGATION_PATTERNS = [
+    re.compile(r'no\s+warrants?\s+(?:are\s+)?(?:outstanding|exercisable|issued)', re.I),
+    re.compile(r'we\s+(?:do\s+not\s+have|have\s+no)\s+(?:any\s+)?warrants', re.I),
 ]
 
 RSPLIT_PATTERNS = [
     re.compile(r'reverse\s+stock\s+split', re.I),
-    re.compile(r'reverse\s+split', re.I),
-    re.compile(r'(\d+)-for-(\d+)\s+reverse', re.I),
+    re.compile(r'(\d+)[\s\-](?:to|for)[\s\-](\d+)\s+reverse', re.I),
 ]
 
-# Majority ownership — require explicit share ownership context, not board/independence %
+# Majority ownership — only structured beneficial-ownership phrasing
 MAJORITY_PATTERNS = [
-    re.compile(r'beneficially own[s]?\s+(\d{1,3}(?:\.\d+)?)\s*%', re.I),
-    re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%.*?beneficially own', re.I),
-    re.compile(r'beneficial owner[ship]*\s+of\s+(\d{1,3}(?:\.\d+)?)\s*%', re.I),
-    re.compile(r'owns\s+(\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:outstanding|issued|common)', re.I),
-    re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:outstanding|issued)\s+(?:shares|common)', re.I),
+    re.compile(r'beneficially\s+own[s]?\s+(?:approximately\s+)?(\d{1,3}(?:\.\d+)?)\s*%', re.I),
+    re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:our|the\s+company\'s|the)\s+(?:outstanding|issued)\s+(?:shares|common\s+stock|voting)', re.I),
+    re.compile(r'beneficial\s+owner(?:ship)?\s+of\s+(?:approximately\s+)?(\d{1,3}(?:\.\d+)?)\s*%', re.I),
+    re.compile(r'\baggregate\s+beneficial\s+ownership\s+of\s+(?:approximately\s+)?(\d{1,3}(?:\.\d+)?)\s*%', re.I),
 ]
+# Item 5 of 13D/G has structured "Percent of class: X%" — most reliable
+ITEM5_PATTERNS = [
+    re.compile(r'(?:percent\s+of\s+class|aggregate\s+amount\s+beneficially\s+owned)[^%]{0,200}?(\d{1,3}(?:\.\d+)?)\s*%', re.I),
+]
+# Anti-patterns — phrases that surface % numbers we should ignore
+MAJORITY_BLACKLIST_NEAR = re.compile(
+    r'(?:director\s+independence|board\s+independence|audit\s+committee|attendance|quorum|'
+    r'voting\s+threshold|approval\s+of|in\s+favor\s+of|tax\s+rate|effective\s+rate|'
+    r'gross\s+margin|operating\s+margin|interest\s+rate|growth\s+rate)', re.I)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 def fmt_num(n, d=2):
     if n is None: return "N/A"
     try:
@@ -76,21 +149,86 @@ def fmt_pct(n, d=1):
     try: return f"{float(n):.{d}f}%"
     except: return "N/A"
 
+def fmt_money(n, d=1):
+    if n is None: return None
+    try:
+        n = float(n)
+        if n >= 1e9: return f"${n/1e9:.{d}f}B"
+        if n >= 1e6: return f"${n/1e6:.{d}f}M"
+        if n >= 1e3: return f"${n/1e3:.{d}f}K"
+        return f"${n:,.0f}"
+    except: return None
+
 def snippet(text, match, before=60, after=100, maxlen=140):
     st = max(0, match.start() - before)
     en = min(len(text), match.end() + after)
-    return text[st:en].strip()[:maxlen]
+    return re.sub(r'\s+', ' ', text[st:en]).strip()[:maxlen]
 
-# ── Polygon fetchers ──────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP
+# ─────────────────────────────────────────────────────────────────────────────
+# SEC policy: ≤10 req/s with proper User-Agent. We rate-limit globally via a
+# single-thread-token "bucket" — every request awaits a minimum gap.
+_EDGAR_GAP = 0.12  # ~8 req/s ceiling (SEC limit is 10/s)
+_edgar_lock = asyncio.Lock()
+_edgar_last  = 0.0
+
+async def _edgar_acquire():
+    global _edgar_last
+    async with _edgar_lock:
+        now = asyncio.get_event_loop().time()
+        wait = _EDGAR_GAP - (now - _edgar_last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _edgar_last = asyncio.get_event_loop().time()
 
 async def poly(session, url):
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
-            return await r.json() if r.status == 200 else {}
-    except: return {}
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            return await r.json(content_type=None) if r.status == 200 else {}
+    except Exception:
+        return {}
 
+async def edgar_json(s, url, retries=3):
+    for attempt in range(retries):
+        await _edgar_acquire()
+        try:
+            async with s.get(url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    return await r.json(content_type=None)
+                if r.status == 429:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return None
+        except Exception:
+            await asyncio.sleep(0.5 * (attempt + 1))
+    return None
+
+async def edgar_text(s, url, mb=120000, retries=3):
+    for attempt in range(retries):
+        await _edgar_acquire()
+        try:
+            async with s.get(url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as r:
+                if r.status == 200:
+                    raw = await r.content.read(mb)
+                    text = raw.decode("utf-8", errors="ignore")
+                    text = re.sub(r'<[^>]+>', ' ', text)
+                    text = unescape(text)
+                    return re.sub(r'\s+', ' ', text)
+                if r.status == 429:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return ""
+        except Exception:
+            await asyncio.sleep(0.5 * (attempt + 1))
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Polygon fetchers
+# ─────────────────────────────────────────────────────────────────────────────
 async def get_details(s, t):
-    # Try active ticker first, fall back to inactive (delisted) search
     d = await poly(s, f"https://api.polygon.io/v3/reference/tickers/{t}?apiKey={POLYGON_KEY}")
     if d.get("results"):
         return d["results"]
@@ -99,12 +237,14 @@ async def get_details(s, t):
     return results[0] if results else {}
 
 async def get_ticker_history(s, t):
-    d = await poly(s, f"https://api.polygon.io/v3/reference/tickers/{t}/events?apiKey={POLYGON_KEY}")
-    events = d.get("results", {}).get("events", [])
+    """FIXED: correct path is /vX/reference/tickers/{t}/events  and  events[].ticker_change.ticker"""
+    d = await poly(s, f"https://api.polygon.io/vX/reference/tickers/{t}/events?apiKey={POLYGON_KEY}")
+    events = (d.get("results") or {}).get("events", [])
     prior = []
     for ev in events:
         if ev.get("type") == "ticker_change":
-            old = ev.get("ticker_symbol", "") or ev.get("old_ticker", "")
+            ch = ev.get("ticker_change") or {}
+            old = ch.get("ticker") or ev.get("ticker_symbol") or ""
             date = ev.get("date", "")
             if old and old.upper() != t.upper():
                 prior.append({"ticker": old.upper(), "date": date})
@@ -134,52 +274,93 @@ async def get_price(s, t):
     r = d.get("results", [])
     return r[0].get("c") if r else None
 
-# ── SEC fetchers ──────────────────────────────────────────────────────────────
 
-async def edgar_json(s, url):
-    try:
-        async with s.get(url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            return await r.json(content_type=None) if r.status == 200 else None
-    except: return None
-
-async def edgar_text(s, url, mb=60000):
-    try:
-        async with s.get(url, headers=SEC_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as r:
-            if r.status != 200: return ""
-            raw = await r.content.read(mb)
-            text = raw.decode("utf-8", errors="ignore")
-            text = re.sub(r'<[^>]+>', ' ', text)  # strip HTML tags
-            text = unescape(text)                  # decode &amp; &#160; etc.
-            return re.sub(r'\s+', ' ', text)
-    except: return ""
-
-async def get_filings(s, cik_raw, forms, n=6):
+# ─────────────────────────────────────────────────────────────────────────────
+# EDGAR — submissions, filings, exhibits
+# ─────────────────────────────────────────────────────────────────────────────
+async def get_submissions(s, cik_raw):
     cik = cik_raw.lstrip("0").zfill(10)
-    data = await edgar_json(s, f"https://data.sec.gov/submissions/CIK{cik}.json")
-    if not data: return []
-    rec   = data.get("filings", {}).get("recent", {})
+    return await edgar_json(s, f"https://data.sec.gov/submissions/CIK{cik}.json")
+
+def _iter_filings(submissions, forms, n=10, since_date=None):
+    """Yield up to n filings matching `forms` (already form-set expanded) since `since_date`."""
+    if not submissions: return
+    rec = submissions.get("filings", {}).get("recent", {})
     flist = rec.get("form", [])
     dates = rec.get("filingDate", [])
     accs  = rec.get("accessionNumber", [])
     docs  = rec.get("primaryDocument", [])
-    out = []
+    yielded = 0
     for i, f in enumerate(flist):
         if f in forms:
-            out.append({"form": f, "date": dates[i], "acc": accs[i],
-                        "doc": docs[i] if i < len(docs) else ""})
-            if len(out) >= n: break
-    return out
+            if since_date and dates[i] < since_date:
+                continue
+            yield {
+                "form": f, "date": dates[i], "acc": accs[i],
+                "doc": docs[i] if i < len(docs) else "",
+            }
+            yielded += 1
+            if yielded >= n:
+                return
 
-# ── Offering size parser ─────────────────────────────────────────────────────
+# Per-build_embed cache so multiple detectors share filing text
+_filing_cache: dict = {}
 
-# Gross/aggregate proceeds: "aggregate proceeds of $5,000,000" / "gross proceeds of $5 million"
-_GROSS_RE  = re.compile(r'(?:aggregate|gross|total)\s+(?:proceeds?|offering\s+(?:price|amount))\s+of\s+\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion|M|B)?', re.I)
-# Shares at price: "1,000,000 shares at $0.50 per share"
-_SHARES_RE = re.compile(r'([\d,]+(?:\.\d+)?)\s*(million|billion|M|B)?\s+(?:shares|units)(?:\s+of\s+[\w\s]+?)?\s+at\s+\$\s*([\d,]+(?:\.\d+)?)', re.I)
-# Explicit offering price only
-_PRICE_RE  = re.compile(r'(?:purchase|offering|exercise)\s+price\s+(?:per\s+share\s+)?of\s+\$\s*([\d,]+(?:\.\d+)?)', re.I)
-# Dollar amount with explicit $ sign followed by million/billion keyword
-_DOLLAR_WORD_RE = re.compile(r'\$\s*([\d,]+(?:\.\d+)?)\s+(million|billion)', re.I)
+async def get_filing_text(s, cik_raw, filing, mb=120000):
+    """Fetch primary doc text. Falls back to scanning index.json for first .htm exhibit.
+    Cached by accession # for the duration of one build_embed call."""
+    cache_key = filing["acc"]
+    if cache_key in _filing_cache:
+        return _filing_cache[cache_key]
+
+    cik_i = int(cik_raw.lstrip("0") or "0")
+    acc = filing["acc"].replace("-", "")
+    text = ""
+    if filing.get("doc"):
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{filing['doc']}"
+        text = await edgar_text(s, url, mb=mb)
+    if not text or len(text) < 500:
+        idx = await edgar_json(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/index.json")
+        if idx:
+            items = idx.get("directory", {}).get("item", [])
+            candidates = sorted(
+                [it for it in items if it["name"].lower().endswith((".htm", ".html", ".txt"))
+                 and not it["name"].lower().endswith("-index.html")
+                 and not it["name"].lower().endswith("-index-headers.html")],
+                key=lambda it: (
+                    0 if "ex99" in it["name"].lower() or "ex-99" in it["name"].lower() else
+                    1 if "ex10" in it["name"].lower() or "ex-10" in it["name"].lower() else 2
+                ))
+            for it in candidates[:2]:
+                url = f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{it['name']}"
+                text = await edgar_text(s, url, mb=mb)
+                if text and len(text) > 500:
+                    break
+    _filing_cache[cache_key] = text
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Offering-size parser
+# ─────────────────────────────────────────────────────────────────────────────
+# All these handle the literal phrasings seen in real prospectuses
+_SIZE_PATTERNS = [
+    # "aggregate offering price of up to $70,000,000"
+    re.compile(r'aggregate\s+(?:offering\s+(?:price|amount)|principal\s+amount|proceeds?)\s+of\s+(?:up\s+to\s+)?\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion)?', re.I),
+    # "Up to $70,000,000 of Common Stock" (cover page)
+    re.compile(r'\bup\s+to\s+\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion)?\s+(?:of|aggregate|in)', re.I),
+    # "gross proceeds of $X"
+    re.compile(r'(?:gross|net|total)\s+proceeds\s+(?:of|to\s+us\s+from\s+the\s+offering\s+of)\s+(?:approximately\s+)?\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion)?', re.I),
+    # "we may sell up to $50 million / $50,000,000"
+    re.compile(r'(?:we\s+may\s+(?:sell|offer|issue)|the\s+offering\s+is\s+for)\s+(?:up\s+to\s+)?\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion)?', re.I),
+    # "$X million offering / placement"
+    re.compile(r'\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion)\s+(?:offering|placement|registered\s+direct|public\s+offering|private\s+placement|atm|at[\s\-]the[\s\-]market)', re.I),
+    # bare "$X million" only when following "for", "of", "totaling"
+    re.compile(r'(?:for|of|totaling|raised|raising)\s+(?:approximately\s+)?\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion)\b', re.I),
+]
+_SHARES_AT_RE = re.compile(
+    r'([\d,]+(?:\.\d+)?)\s*(million|billion)?\s+(?:shares|units)\s+(?:of\s+(?:our\s+)?(?:common\s+stock|class\s+\w+\s+common)\s+)?at\s+\$\s*([\d,]+(?:\.\d+)?)\s*(?:per\s+share)?',
+    re.I)
 
 def _scale(val, unit):
     u = (unit or "").lower()
@@ -188,189 +369,282 @@ def _scale(val, unit):
     return val
 
 def parse_offering_size(text, mkt_cap=None):
-    """Extract dollar offering size + per-share price. Returns label like '$5.0M @ $0.50/sh'."""
+    """Extract dollar offering size + per-share price. Returns label like '$70.0M @ $0.50/sh'."""
+    if not text: return ""
     gross = None
     price = None
 
-    # 1. Gross/aggregate proceeds — most reliable
-    m = _GROSS_RE.search(text)
-    if m:
-        try: gross = _scale(float(m.group(1).replace(",","")), m.group(2))
-        except: pass
+    # Try each pattern; take FIRST plausible result (earliest in doc usually = headline number)
+    for pat in _SIZE_PATTERNS:
+        m = pat.search(text)
+        if not m: continue
+        try:
+            v = float(m.group(1).replace(",", ""))
+            v = _scale(v, m.group(2) if m.lastindex and m.lastindex >= 2 else None)
+        except Exception:
+            continue
+        # Sanity: must be at least $100k and (if mkt cap known) <= 100x mkt cap
+        if v < 100_000:
+            continue
+        if mkt_cap and v > mkt_cap * 100:
+            continue
+        gross = v
+        break
 
-    # 2. "$X million/billion" — explicit word required, no bare numbers
-    if gross is None:
-        m = _DOLLAR_WORD_RE.search(text)
-        if m:
-            try: gross = _scale(float(m.group(1).replace(",","")), m.group(2))
-            except: pass
-
-    # 3. Shares at price — only if price is a plausible per-share price (<$1000)
-    m2 = _SHARES_RE.search(text)
+    # Per-share price + cross-check shares*price ≈ gross
+    m2 = _SHARES_AT_RE.search(text)
     if m2:
         try:
-            shares = _scale(float(m2.group(1).replace(",","")), m2.group(2))
-            px     = float(m2.group(3).replace(",",""))
-            if px < 1000:  # sanity: per-share price
-                if gross is None and shares < 1e10:
-                    gross = shares * px
+            shares = _scale(float(m2.group(1).replace(",", "")), m2.group(2))
+            px     = float(m2.group(3).replace(",", ""))
+            if 0.0001 < px < 10_000 and shares < 1e10:
                 price = px
-        except: pass
-
-    # 4. Explicit price only
-    if price is None:
-        m3 = _PRICE_RE.search(text)
-        if m3:
-            try: price = float(m3.group(1).replace(",",""))
-            except: pass
-
-    # Sanity check: gross must be >= $10K and if mkt_cap known, <= 50x mkt_cap
-    if gross is not None:
-        if gross < 10_000:
-            gross = None
-        elif mkt_cap and gross > mkt_cap * 50:
-            gross = None  # almost certainly a share count parsed as dollars
+                if gross is None:
+                    derived = shares * px
+                    if derived >= 100_000 and (not mkt_cap or derived <= mkt_cap * 100):
+                        gross = derived
+        except Exception:
+            pass
 
     parts = []
     if gross:
-        parts.append(f"${fmt_num(gross, d=1)}")
+        m_str = fmt_money(gross, d=1)
+        if m_str:
+            parts.append(m_str)
     if price and 0.0001 < price < 100_000:
         parts.append(f"@ ${price:.4f}/sh" if price < 0.01 else f"@ ${price:.2f}/sh")
-    return "  ".join(parts) if parts else ""
+    return "  ".join(parts)
 
-# ── Dilution detectors ────────────────────────────────────────────────────────
 
-async def detect_atm(s, cik_raw, mkt_cap=None):
-    cik_i = int(cik_raw.lstrip("0") or "0")
-    filings = await get_filings(s, cik_raw, {"S-3", "S-3/A", "424B3", "424B4"}, 5)
-    for f in filings:
-        if not f["doc"]: continue
-        acc = f["acc"].replace("-", "")
-        text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Detectors
+# ─────────────────────────────────────────────────────────────────────────────
+def _is_pipe_risk_factor(text, match):
+    """True if the PIPE match is generic risk-factor language (‘may engage in’)."""
+    st = max(0, match.start() - 100)
+    en = min(len(text), match.end() + 50)
+    window = text[st:en]
+    return bool(PIPE_RISK_FACTOR_RE.search(window))
+
+def _has_warrant_negation(text, match):
+    st = max(0, match.start() - 80)
+    en = min(len(text), match.end() + 80)
+    window = text[st:en]
+    return any(p.search(window) for p in WARRANT_NEGATION_PATTERNS)
+
+def _is_majority_blacklisted(text, match):
+    st = max(0, match.start() - 120)
+    en = min(len(text), match.end() + 60)
+    window = text[st:en]
+    return bool(MAJORITY_BLACKLIST_NEAR.search(window))
+
+
+async def detect_atm(s, cik_raw, submissions, mkt_cap=None):
+    """Active ATM = recent S-3/424B5/424B3/424B4/8-K with at-the-market or sales-agreement language.
+
+    Strategy: prefer 424B5/S-3 prospectus matches over 8-Ks (better evidence).
+    Skip filings that explicitly terminate the program. Require strong patterns
+    (at-the-market, ATM offering) over weak ones (sales agreement) for 8-Ks.
+    """
+    cutoff_18mo = (datetime.utcnow() - timedelta(days=540)).strftime("%Y-%m-%d")
+    prospectus = list(_iter_filings(submissions, ATM_PROSPECTUS_FORMS, n=5, since_date=cutoff_18mo))
+    eightks    = list(_iter_filings(submissions, OFFERING_8K_FORMS, n=6, since_date=cutoff_18mo))
+
+    # Strong-evidence patterns (must match for 8-K-only sources)
+    STRONG = ATM_PATTERNS[:3]   # at-the-market, ATM offering, sales agreement
+
+    # Pass 1 — prospectus filings (424B5 etc) — strong source
+    for f in prospectus:
+        text = await get_filing_text(s, cik_raw, f, mb=80000)
         if not text: continue
+        if any(p.search(text) for p in ATM_TERMINATED_PATTERNS): continue
         for pat in ATM_PATTERNS:
             m = pat.search(text)
             if m:
                 size = parse_offering_size(text, mkt_cap)
                 return {"active": True, "form": f["form"], "date": f["date"],
                         "evidence": snippet(text, m)[:120], "size": size}
+
+    # Pass 2 — 8-K filings — require strong pattern AND "at-the-market" language
+    for f in eightks:
+        text = await get_filing_text(s, cik_raw, f, mb=60000)
+        if not text: continue
+        if any(p.search(text) for p in ATM_TERMINATED_PATTERNS): continue
+        # Require BOTH a strong pattern AND "at-the-market" language
+        atm_lang = re.search(r'at[\s\-]the[\s\-]market', text, re.I)
+        if not atm_lang: continue
+        for pat in STRONG:
+            m = pat.search(text)
+            if m:
+                size = parse_offering_size(text, mkt_cap)
+                # Use the at-the-market match for better evidence snippet
+                return {"active": True, "form": f["form"], "date": f["date"],
+                        "evidence": snippet(text, atm_lang)[:120], "size": size}
     return {"active": False}
 
-async def detect_shelf(s, cik_raw, mkt_cap=None):
-    """Check for a live S-3 shelf (filed in last 3 years, which is the SEC effective window)."""
-    cik_i = int(cik_raw.lstrip("0") or "0")
-    filings = await get_filings(s, cik_raw, {"S-3", "S-3/A"}, 3)
-    cutoff = (datetime.utcnow() - timedelta(days=3*365)).strftime("%Y-%m-%d")
-    for f in filings:
-        if f["date"] >= cutoff:
-            size = ""
-            if f.get("doc"):
-                acc = f["acc"].replace("-", "")
-                text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}")
-                if text: size = parse_offering_size(text, mkt_cap)
-            return {"active": True, "form": f["form"], "date": f["date"], "size": size}
+
+async def detect_shelf(s, cik_raw, submissions, mkt_cap=None):
+    """Live S-3 shelf = S-3 filed within ~3 years AND has matching EFFECT (or is S-3ASR auto-effective)."""
+    cutoff = (datetime.utcnow() - timedelta(days=SHELF_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    s3_filings = list(_iter_filings(submissions, SHELF_FORMS, n=4, since_date=cutoff))
+    if not s3_filings: return {"active": False}
+    effects = list(_iter_filings(submissions, EFFECT_FORMS, n=20))
+    effect_dates = sorted([e["date"] for e in effects], reverse=True)
+
+    for f in s3_filings:
+        # S-3ASR is automatically effective on filing
+        is_effective = (f["form"] == "S-3ASR")
+        if not is_effective:
+            # Look for EFFECT filing dated >= S-3 filing date
+            is_effective = any(d >= f["date"] for d in effect_dates)
+        if not is_effective:
+            continue
+        size = ""
+        text = await get_filing_text(s, cik_raw, f, mb=80000)
+        if text:
+            size = parse_offering_size(text, mkt_cap)
+        return {"active": True, "form": f["form"], "date": f["date"], "size": size}
     return {"active": False}
 
-async def detect_pipe_rd(s, cik_raw, mkt_cap=None):
-    """Scan recent S-1 / 424B3 filings for PIPE or registered direct language."""
-    cik_i = int(cik_raw.lstrip("0") or "0")
-    filings = await get_filings(s, cik_raw, {"S-1", "S-1/A", "424B3", "424B4"}, 5)
+
+async def detect_pipe_rd(s, cik_raw, submissions, mkt_cap=None):
+    """PIPE / Registered Direct in last 12 months — require event-context, dollar size."""
+    cutoff = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")
+    filings = list(_iter_filings(submissions, PIPE_FORMS, n=8, since_date=cutoff))
     hits = []
+    seen_keys = set()  # dedupe by (label, month) — multiple forms reference same offering
     for f in filings:
-        if not f["doc"]: continue
-        acc = f["acc"].replace("-", "")
-        text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}")
+        text = await get_filing_text(s, cik_raw, f, mb=80000)
         if not text: continue
         for pat in PIPE_PATTERNS:
             m = pat.search(text)
-            if m:
-                size = parse_offering_size(text, mkt_cap)
-                label = m.group(0).strip()
-                if size: label = f"{label} — {size}"
-                hits.append({"form": f["form"], "date": f["date"], "label": label[:60]})
-                break
-    return hits
-
-async def detect_8k_offerings(s, cik_raw, mkt_cap=None):
-    """Scan recent 8-Ks for dilutive offering announcements."""
-    cik_i = int(cik_raw.lstrip("0") or "0")
-    filings = await get_filings(s, cik_raw, {"8-K", "8-K/A"}, 8)
-    hits = []
-    for f in filings:
-        if not f["doc"]: continue
-        acc = f["acc"].replace("-", "")
-        text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}", mb=30000)
-        if not text: continue
-        for pat in OFFERING_8K_PATTERNS:
-            m = pat.search(text)
-            if m:
-                size = parse_offering_size(text, mkt_cap)
-                label = m.group(0).strip()
-                if size: label = f"{label} — {size}"
-                hits.append({"date": f["date"], "label": label[:70]})
-                break
-        if len(hits) >= 3: break
-    return hits
-
-async def detect_warrants(s, cik_raw, mkt_cap=None):
-    """Check most recent S-1/424B for warrant mentions."""
-    cik_i = int(cik_raw.lstrip("0") or "0")
-    filings = await get_filings(s, cik_raw, {"424B3", "424B4", "S-1", "S-1/A"}, 3)
-    for f in filings:
-        if not f["doc"]: continue
-        acc = f["acc"].replace("-", "")
-        text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}")
-        if not text: continue
-        for pat in WARRANT_PATTERNS:
-            m = pat.search(text)
-            if m:
-                size = parse_offering_size(text, mkt_cap)
-                return {"found": True, "form": f["form"], "date": f["date"],
-                        "ctx": snippet(text, m, before=0, after=80, maxlen=100), "size": size}
-    return {"found": False}
-
-async def detect_reverse_split(s, cik_raw):
-    """Check recent 8-K and DEF 14A for reverse split history."""
-    cik_i = int(cik_raw.lstrip("0") or "0")
-    filings = await get_filings(s, cik_raw, {"8-K", "8-K/A", "DEF 14A"}, 10)
-    hits = []
-    for f in filings:
-        if not f["doc"]: continue
-        acc = f["acc"].replace("-", "")
-        text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}", mb=30000)
-        if not text: continue
-        for pat in RSPLIT_PATTERNS:
-            m = pat.search(text)
-            if m:
-                hits.append({"date": f["date"], "ctx": snippet(text, m, before=0, after=60, maxlen=80)})
-                break
+            if not m: continue
+            if _is_pipe_risk_factor(text, m): continue
+            size = parse_offering_size(text, mkt_cap)
+            label = m.group(0).strip()
+            if size: label = f"{label} — {size}"
+            key = (label.lower(), f["date"][:7])
+            if key in seen_keys: break
+            seen_keys.add(key)
+            hits.append({"form": f["form"], "date": f["date"], "label": label[:70]})
+            break
         if len(hits) >= 2: break
     return hits
 
-async def detect_majority(s, cik_raw):
-    cik_i = int(cik_raw.lstrip("0") or "0")
-    filings = await get_filings(s, cik_raw, {"DEF 14A", "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"}, 4)
+
+async def detect_8k_offerings(s, cik_raw, submissions, mkt_cap=None):
+    """Recent 8-K offering announcements — last 12mo, deduped by month."""
+    cutoff = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")
+    filings = list(_iter_filings(submissions, OFFERING_8K_FORMS, n=10, since_date=cutoff))
+    hits = []
+    seen_months = set()
+    for f in filings:
+        month_key = f["date"][:7]
+        if month_key in seen_months: continue
+        text = await get_filing_text(s, cik_raw, f, mb=60000)
+        if not text: continue
+        for pat in OFFERING_8K_PATTERNS:
+            m = pat.search(text)
+            if not m: continue
+            size = parse_offering_size(text, mkt_cap)
+            label = m.group(0).strip()
+            if size: label = f"{label} — {size}"
+            hits.append({"date": f["date"], "label": label[:80]})
+            seen_months.add(month_key)
+            break
+        if len(hits) >= 3: break
+    return hits
+
+
+async def detect_warrants(s, cik_raw, submissions, mkt_cap=None):
+    """Warrants outstanding — guard against negation."""
+    cutoff = (datetime.utcnow() - timedelta(days=540)).strftime("%Y-%m-%d")
+    filings = list(_iter_filings(submissions, WARRANT_FORMS, n=4, since_date=cutoff))
+    for f in filings:
+        text = await get_filing_text(s, cik_raw, f, mb=80000)
+        if not text: continue
+        for pat in WARRANT_PATTERNS:
+            m = pat.search(text)
+            if not m: continue
+            if _has_warrant_negation(text, m): continue
+            size = parse_offering_size(text, mkt_cap)
+            return {"found": True, "form": f["form"], "date": f["date"],
+                    "ctx": snippet(text, m, before=0, after=80, maxlen=100), "size": size}
+    return {"found": False}
+
+
+async def detect_reverse_split(s, cik_raw, submissions):
+    cutoff = (datetime.utcnow() - timedelta(days=730)).strftime("%Y-%m-%d")
+    filings = list(_iter_filings(submissions, SPLIT_FORMS, n=10, since_date=cutoff))
+    hits = []
+    seen_quarters = set()   # dedupe — same event referenced repeatedly
+    for f in filings:
+        # quarter-bucket dedupe (year + quarter)
+        y, mo, _ = f["date"].split("-")
+        q = (int(y), (int(mo) - 1) // 3)
+        if q in seen_quarters: continue
+        text = await get_filing_text(s, cik_raw, f, mb=60000)
+        if not text: continue
+        for pat in RSPLIT_PATTERNS:
+            m = pat.search(text)
+            if not m: continue
+            ctx = snippet(text, m, before=80, after=80, maxlen=160).lower()
+            # Skip generic "may consider a reverse split" boilerplate
+            if "may " in ctx or "could " in ctx or "consider " in ctx or "propose" in ctx:
+                continue
+            hits.append({"date": f["date"], "ctx": snippet(text, m, before=0, after=60, maxlen=80)})
+            seen_quarters.add(q)
+            break
+        if len(hits) >= 2: break
+    return hits
+
+
+async def detect_majority(s, cik_raw, submissions):
+    """Majority owner — prefer 13D/G Item 5 percent-of-class; fall back to DEF 14A beneficial-ownership."""
+    cutoff = (datetime.utcnow() - timedelta(days=540)).strftime("%Y-%m-%d")
+    # 13D/G first
+    filings_dg = list(_iter_filings(submissions, _form_set("SC 13D", "SC 13D/A"), n=2, since_date=cutoff))
+    filings_dg += list(_iter_filings(submissions, _form_set("SC 13G", "SC 13G/A"), n=2, since_date=cutoff))
     best = {"found": False}
     high = 0.0
-    for f in filings:
-        if not f["doc"]: continue
-        acc = f["acc"].replace("-", "")
-        text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}", mb=80000)
+
+    for f in filings_dg:
+        text = await get_filing_text(s, cik_raw, f, mb=60000)
+        if not text: continue
+        # Item 5 patterns
+        for pat in ITEM5_PATTERNS:
+            for m in pat.finditer(text):
+                if _is_majority_blacklisted(text, m): continue
+                try: pct = float(m.group(1))
+                except: continue
+                if 50 <= pct <= 100 and pct > high:
+                    high = pct
+                    best = {"found": True, "pct": pct, "form": f["form"], "date": f["date"],
+                            "ctx": snippet(text, m, before=80, after=40, maxlen=120)}
+
+    # Then DEF 14A beneficial-ownership
+    filings_proxy = list(_iter_filings(submissions, _form_set("DEF 14A"), n=2, since_date=cutoff))
+    for f in filings_proxy:
+        text = await get_filing_text(s, cik_raw, f, mb=120000)
         if not text: continue
         for pat in MAJORITY_PATTERNS:
             for m in pat.finditer(text):
+                if _is_majority_blacklisted(text, m): continue
                 try: pct = float(m.group(1))
                 except: continue
-                if pct >= 50 and pct > high:
+                if 50 <= pct <= 100 and pct > high:
                     high = pct
                     best = {"found": True, "pct": pct, "form": f["form"], "date": f["date"],
                             "ctx": snippet(text, m, before=80, after=40, maxlen=120)}
     return best
 
-# ── Embed builder ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Embed builder
+# ─────────────────────────────────────────────────────────────────────────────
 async def build_embed(ticker):
     ticker = ticker.upper()
+    _filing_cache.clear()  # per-call cache for filing text
     async with aiohttp.ClientSession() as s:
         det, flt, si, sv, price, prior_tickers = await asyncio.gather(
             get_details(s, ticker), get_float(s, ticker),
@@ -387,31 +661,38 @@ async def build_embed(ticker):
         maj = {"found": False}
 
         if cik:
-            (atm, shelf, pipe_rd, offerings_8k,
-             warrants, rsplits, maj) = await asyncio.gather(
-                detect_atm(s, cik, mkt_cap=det.get('market_cap')),
-                detect_shelf(s, cik, mkt_cap=det.get('market_cap')),
-                detect_pipe_rd(s, cik, mkt_cap=det.get('market_cap')),
-                detect_8k_offerings(s, cik, mkt_cap=det.get('market_cap')),
-                detect_warrants(s, cik, mkt_cap=det.get('market_cap')),
-                detect_reverse_split(s, cik),
-                detect_majority(s, cik))
+            submissions = await get_submissions(s, cik)
+            if submissions:
+                mkt_cap = det.get("market_cap")
+                (atm, shelf, pipe_rd, offerings_8k,
+                 warrants, rsplits, maj) = await asyncio.gather(
+                    detect_atm(s, cik, submissions, mkt_cap),
+                    detect_shelf(s, cik, submissions, mkt_cap),
+                    detect_pipe_rd(s, cik, submissions, mkt_cap),
+                    detect_8k_offerings(s, cik, submissions, mkt_cap),
+                    detect_warrants(s, cik, submissions, mkt_cap),
+                    detect_reverse_split(s, cik, submissions),
+                    detect_majority(s, cik, submissions))
 
-    float_v = flt.get("free_float")
-    float_p = flt.get("free_float_percent")
-    si_v    = si.get("short_interest")
-    dtc     = si.get("days_to_cover")
-    si_dt   = si.get("settlement_date", "")
-    sv_r    = sv.get("short_volume_ratio")
-    si_pct  = (float(si_v)/float(float_v))*100 if si_v and float_v else None
-    atm_on  = atm.get("active", False)
-    maj_on  = maj.get("found", False)
-    locale  = (det.get("locale") or "").lower()
-    country = (det.get("address", {}).get("country") or "").lower()
-    china_hq = locale in CHINA_CODES or country in CHINA_CODES
+    float_v  = flt.get("free_float")
+    float_p  = flt.get("free_float_percent")
+    si_v     = si.get("short_interest")
+    dtc      = si.get("days_to_cover")
+    si_dt    = si.get("settlement_date", "")
+    sv_r     = sv.get("short_volume_ratio")
+    si_pct   = (float(si_v) / float(float_v)) * 100 if si_v and float_v else None
+    atm_on   = atm.get("active", False)
+    maj_on   = maj.get("found", False)
+    locale     = (det.get("locale") or "").lower()
+    country    = (det.get("address", {}).get("country") or "").lower()
+    desc       = det.get("description") or ""
+    china_hq   = (locale in CHINA_CODES or country in CHINA_CODES
+                  or bool(CHINA_DESC_RE.search(desc[:1000])))
 
     any_red = atm_on or maj_on or china_hq or shelf.get("active") or rsplits or (si_pct and si_pct > 25)
-    color = 0xFF3333 if any_red else (0xFF9900 if (pipe_rd or offerings_8k or warrants.get("found") or (si_pct and si_pct > 12)) else 0x00CC66)
+    color = (0xFF3333 if any_red else
+             (0xFF9900 if (pipe_rd or offerings_8k or warrants.get("found") or (si_pct and si_pct > 12))
+              else 0x00CC66))
 
     price_s = f"${price:,.3f}" if price else "N/A"
     emb = discord.Embed(
@@ -420,43 +701,37 @@ async def build_embed(ticker):
     emb.description = (f"**Price:** {price_s}  ·  **Mkt Cap:** {fmt_num(det.get('market_cap'))}  ·  "
                        f"**Float:** {fmt_num(float_v)} ({fmt_pct(float_p)})")
 
-    # ── Dilution signals ──────────────────────────────────────────────────────
+    # ── Dilution signals
     dil_lines = []
 
-    # ATM
     if atm_on:
-        atm_sz = f"  {atm['size']}" if atm.get('size') else ""
-        dil_lines.append(f"🔴 **Active ATM**{atm_sz} — `{atm['form']}` {atm['date']}\n> {atm.get('evidence','')[:100]}...")
+        sz = f"  {atm['size']}" if atm.get('size') else ""
+        dil_lines.append(f"🔴 **Active ATM**{sz} — `{atm['form']}` {atm['date']}\n> {atm.get('evidence','')[:100]}")
     else:
         dil_lines.append("🟢 No active ATM")
 
-    # Live shelf
     if shelf.get("active"):
-        shelf_sz = f"  {shelf['size']}" if shelf.get('size') else ""
-        dil_lines.append(f"🔴 **Live S-3 Shelf**{shelf_sz} — filed {shelf['date']}")
+        sz = f"  {shelf['size']}" if shelf.get('size') else ""
+        dil_lines.append(f"🔴 **Live S-3 Shelf**{sz} — filed {shelf['date']}")
     else:
         dil_lines.append("🟢 No active shelf registration")
 
-    # PIPE / Registered Direct
     if pipe_rd:
         for p in pipe_rd[:2]:
             dil_lines.append(f"🟠 **{p['label'].strip()}** — `{p['form']}` {p['date']}")
     else:
         dil_lines.append("🟢 No recent PIPE / Registered Direct")
 
-    # 8-K offerings
     if offerings_8k:
         for o in offerings_8k[:2]:
             dil_lines.append(f"🟠 **8-K** {o['date']} — {o['label'].strip()}")
 
-    # Warrants
     if warrants.get("found"):
-        w_sz = f"  {warrants['size']}" if warrants.get('size') else ""
-        dil_lines.append(f"🟠 **Warrants outstanding**{w_sz} — `{warrants['form']}` {warrants['date']}")
+        sz = f"  {warrants['size']}" if warrants.get('size') else ""
+        dil_lines.append(f"🟠 **Warrants outstanding**{sz} — `{warrants['form']}` {warrants['date']}")
     else:
         dil_lines.append("🟢 No warrant overhang detected")
 
-    # Reverse splits
     if rsplits:
         for r in rsplits[:2]:
             dil_lines.append(f"🔴 **Reverse split** {r['date']} — {r['ctx'].strip()[:70]}")
@@ -465,23 +740,29 @@ async def build_embed(ticker):
 
     emb.add_field(name="⚠️  Dilution Signals", value="\n".join(dil_lines), inline=False)
 
-    # ── Ownership ─────────────────────────────────────────────────────────────
+    # ── Ownership
     if maj_on:
         maj_val = (f"🔴  **{fmt_pct(maj.get('pct'))} MAJORITY HOLDER**\n"
                    f"`{maj.get('form')}` {maj.get('date')}\n"
-                   f"> {maj.get('ctx','')[:100]}...")
+                   f"> {maj.get('ctx','')[:100]}")
     else:
         maj_val = "🟢  No >50% majority holder found"
     emb.add_field(name="Insider / Majority Ownership", value=maj_val, inline=False)
 
-    # ── China / HQ ────────────────────────────────────────────────────────────
+    # ── HQ
     if china_hq:
-        china_val = f"🔴  **CHINA-BASED** (locale: `{det.get('locale','?').upper()}`)"
+        why = []
+        if locale in CHINA_CODES: why.append(f"locale={locale.upper()}")
+        if country in CHINA_CODES: why.append(f"country={country.upper()}")
+        if CHINA_DESC_RE.search(desc[:1000]):
+            m = CHINA_DESC_RE.search(desc[:1000])
+            if m: why.append(f"description: ‘{m.group(0)}’")
+        china_val = "🔴  **CHINA-BASED** (" + "  ·  ".join(why) + ")"
     else:
         china_val = "🟢  Not China-headquartered"
     emb.add_field(name="HQ / Domicile", value=china_val, inline=False)
 
-    # ── Ticker history ────────────────────────────────────────────────────────
+    # ── Ticker history
     if prior_tickers:
         ticker_val = "⚠️  **Prior tickers:** " + "  ·  ".join(
             f"`{p['ticker']}` ({p['date']})" for p in prior_tickers[:5])
@@ -489,7 +770,7 @@ async def build_embed(ticker):
         ticker_val = "🟢  No ticker changes found"
     emb.add_field(name="Ticker History", value=ticker_val, inline=False)
 
-    # ── Short interest ────────────────────────────────────────────────────────
+    # ── Short interest
     short_lines = []
     if si_v:
         short_lines.append(f"**SI:** {fmt_num(si_v)} ({fmt_pct(si_pct)} of float)  ·  as of {si_dt}")
@@ -506,15 +787,19 @@ async def build_embed(ticker):
     emb.set_footer(text="Polygon.io + SEC EDGAR  ·  data may be delayed")
     return emb
 
-# ── Bot ───────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Bot
+# ─────────────────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+
 @client.event
 async def on_ready():
     print(f"✅  Dilution bot online as {client.user}  (guild {GUILD_ID})")
+
 
 @client.event
 async def on_message(msg: discord.Message):
@@ -528,6 +813,7 @@ async def on_message(msg: discord.Message):
                 await msg.reply(embed=await build_embed(ticker), mention_author=False)
             except Exception as e:
                 await msg.reply(f"⚠️  Error for `${ticker}`: {e}", mention_author=False)
+
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
