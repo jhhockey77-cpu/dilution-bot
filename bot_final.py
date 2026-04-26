@@ -172,11 +172,14 @@ async def get_filings(s, cik_raw, forms, n=6):
 
 # ── Offering size parser ─────────────────────────────────────────────────────
 
-# Matches: $5,000,000 / $5 million / $2.5M / 1,000,000 shares at $X.XX per share
-_DOLLAR_RE  = re.compile(r'\$\s*(\d[\d,]*(?:\.\d+)?)\s*(million|billion|M|B)?', re.I)
-_SHARES_RE  = re.compile(r'(\d[\d,]*(?:\.\d+)?)\s*(million|billion|M|B)?\s+(?:shares|units)\s+(?:of\s+common\s+stock\s+)?at\s+\$\s*(\d[\d,]*(?:\.\d+)?)', re.I)
-_GROSS_RE   = re.compile(r'(?:aggregate|gross|total)\s+(?:proceeds?|offering\s+(?:price|amount))\s+of\s+\$\s*(\d[\d,]*(?:\.\d+)?)\s*(million|billion|M|B)?', re.I)
-_PRICE_RE   = re.compile(r'(?:purchase|offering|exercise)\s+price\s+of\s+\$\s*(\d[\d,]*(?:\.\d+)?)', re.I)
+# Gross/aggregate proceeds: "aggregate proceeds of $5,000,000" / "gross proceeds of $5 million"
+_GROSS_RE  = re.compile(r'(?:aggregate|gross|total)\s+(?:proceeds?|offering\s+(?:price|amount))\s+of\s+\$\s*([\d,]+(?:\.\d+)?)\s*(million|billion|M|B)?', re.I)
+# Shares at price: "1,000,000 shares at $0.50 per share"
+_SHARES_RE = re.compile(r'([\d,]+(?:\.\d+)?)\s*(million|billion|M|B)?\s+(?:shares|units)(?:\s+of\s+[\w\s]+?)?\s+at\s+\$\s*([\d,]+(?:\.\d+)?)', re.I)
+# Explicit offering price only
+_PRICE_RE  = re.compile(r'(?:purchase|offering|exercise)\s+price\s+(?:per\s+share\s+)?of\s+\$\s*([\d,]+(?:\.\d+)?)', re.I)
+# Dollar amount with explicit $ sign followed by million/billion keyword
+_DOLLAR_WORD_RE = re.compile(r'\$\s*([\d,]+(?:\.\d+)?)\s+(million|billion)', re.I)
 
 def _scale(val, unit):
     u = (unit or "").lower()
@@ -184,35 +187,49 @@ def _scale(val, unit):
     if u in ("million", "m"): return val * 1e6
     return val
 
-def parse_offering_size(text, window=600):
-    """Extract offering size/price from a text window. Returns a short label like '$5.0M at $0.50/sh'."""
-    parts = []
+def parse_offering_size(text):
+    """Extract dollar offering size + per-share price. Returns label like '$5.0M @ $0.50/sh'."""
+    gross = None
+    price = None
 
-    # Try gross proceeds first
+    # 1. Gross proceeds pattern
     m = _GROSS_RE.search(text)
     if m:
-        try:
-            amt = _scale(float(m.group(1).replace(",","")), m.group(2))
-            parts.append(fmt_num(amt, d=1))
+        try: gross = _scale(float(m.group(1).replace(",","")), m.group(2))
         except: pass
 
-    # Try shares-at-price pattern
+    # 2. $ X million/billion pattern (only count if has explicit million/billion word)
+    if gross is None:
+        m = _DOLLAR_WORD_RE.search(text)
+        if m:
+            try: gross = _scale(float(m.group(1).replace(",","")), m.group(2))
+            except: pass
+
+    # 3. Shares at price — derive gross and/or price
     m2 = _SHARES_RE.search(text)
     if m2:
         try:
             shares = _scale(float(m2.group(1).replace(",","")), m2.group(2))
-            price  = float(m2.group(3).replace(",",""))
-            if not parts:
-                parts.append(fmt_num(shares * price, d=1))
-            parts.append(f"${price:.2f}/sh")
+            px     = float(m2.group(3).replace(",",""))
+            # Only use share-derived gross if we don't already have one
+            # and share count looks reasonable (not 100B+)
+            if gross is None and shares < 1e11:
+                gross = shares * px
+            price = px
         except: pass
-    else:
-        # Try just offering price
+
+    # 4. Explicit price only
+    if price is None:
         m3 = _PRICE_RE.search(text)
         if m3:
-            try: parts.append(f"${float(m3.group(1)):.2f}/sh")
+            try: price = float(m3.group(1).replace(",",""))
             except: pass
 
+    parts = []
+    if gross and gross >= 1000:   # ignore tiny noise values
+        parts.append(f"${fmt_num(gross, d=1)}")
+    if price and price < 10000:   # ignore absurd prices
+        parts.append(f"@ ${price:.2f}/sh")
     return "  ".join(parts) if parts else ""
 
 # ── Dilution detectors ────────────────────────────────────────────────────────
