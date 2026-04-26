@@ -170,6 +170,51 @@ async def get_filings(s, cik_raw, forms, n=6):
             if len(out) >= n: break
     return out
 
+# ── Offering size parser ─────────────────────────────────────────────────────
+
+# Matches: $5,000,000 / $5 million / $2.5M / 1,000,000 shares at $X.XX per share
+_DOLLAR_RE  = re.compile(r'\$\s*(\d[\d,]*(?:\.\d+)?)\s*(million|billion|M|B)?', re.I)
+_SHARES_RE  = re.compile(r'(\d[\d,]*(?:\.\d+)?)\s*(million|billion|M|B)?\s+(?:shares|units)\s+(?:of\s+common\s+stock\s+)?at\s+\$\s*(\d[\d,]*(?:\.\d+)?)', re.I)
+_GROSS_RE   = re.compile(r'(?:aggregate|gross|total)\s+(?:proceeds?|offering\s+(?:price|amount))\s+of\s+\$\s*(\d[\d,]*(?:\.\d+)?)\s*(million|billion|M|B)?', re.I)
+_PRICE_RE   = re.compile(r'(?:purchase|offering|exercise)\s+price\s+of\s+\$\s*(\d[\d,]*(?:\.\d+)?)', re.I)
+
+def _scale(val, unit):
+    u = (unit or "").lower()
+    if u in ("billion", "b"): return val * 1e9
+    if u in ("million", "m"): return val * 1e6
+    return val
+
+def parse_offering_size(text, window=600):
+    """Extract offering size/price from a text window. Returns a short label like '$5.0M at $0.50/sh'."""
+    parts = []
+
+    # Try gross proceeds first
+    m = _GROSS_RE.search(text)
+    if m:
+        try:
+            amt = _scale(float(m.group(1).replace(",","")), m.group(2))
+            parts.append(fmt_num(amt, d=1))
+        except: pass
+
+    # Try shares-at-price pattern
+    m2 = _SHARES_RE.search(text)
+    if m2:
+        try:
+            shares = _scale(float(m2.group(1).replace(",","")), m2.group(2))
+            price  = float(m2.group(3).replace(",",""))
+            if not parts:
+                parts.append(fmt_num(shares * price, d=1))
+            parts.append(f"${price:.2f}/sh")
+        except: pass
+    else:
+        # Try just offering price
+        m3 = _PRICE_RE.search(text)
+        if m3:
+            try: parts.append(f"${float(m3.group(1)):.2f}/sh")
+            except: pass
+
+    return "  ".join(parts) if parts else ""
+
 # ── Dilution detectors ────────────────────────────────────────────────────────
 
 async def detect_atm(s, cik_raw):
@@ -209,10 +254,12 @@ async def detect_pipe_rd(s, cik_raw):
         for pat in PIPE_PATTERNS:
             m = pat.search(text)
             if m:
-                hits.append({"form": f["form"], "date": f["date"],
-                             "label": m.group(0)[:30]})
+                size = parse_offering_size(text)
+                label = m.group(0).strip()
+                if size: label = f"{label} — {size}"
+                hits.append({"form": f["form"], "date": f["date"], "label": label[:60]})
                 break
-    return hits  # list of recent PIPE/RD filings
+    return hits
 
 async def detect_8k_offerings(s, cik_raw):
     """Scan recent 8-Ks for dilutive offering announcements."""
@@ -227,7 +274,10 @@ async def detect_8k_offerings(s, cik_raw):
         for pat in OFFERING_8K_PATTERNS:
             m = pat.search(text)
             if m:
-                hits.append({"date": f["date"], "label": snippet(text, m, before=0, after=60, maxlen=80)})
+                size = parse_offering_size(text)
+                label = m.group(0).strip()
+                if size: label = f"{label} — {size}"
+                hits.append({"date": f["date"], "label": label[:70]})
                 break
         if len(hits) >= 3: break
     return hits
