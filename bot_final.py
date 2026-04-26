@@ -187,35 +187,34 @@ def _scale(val, unit):
     if u in ("million", "m"): return val * 1e6
     return val
 
-def parse_offering_size(text):
+def parse_offering_size(text, mkt_cap=None):
     """Extract dollar offering size + per-share price. Returns label like '$5.0M @ $0.50/sh'."""
     gross = None
     price = None
 
-    # 1. Gross proceeds pattern
+    # 1. Gross/aggregate proceeds — most reliable
     m = _GROSS_RE.search(text)
     if m:
         try: gross = _scale(float(m.group(1).replace(",","")), m.group(2))
         except: pass
 
-    # 2. $ X million/billion pattern (only count if has explicit million/billion word)
+    # 2. "$X million/billion" — explicit word required, no bare numbers
     if gross is None:
         m = _DOLLAR_WORD_RE.search(text)
         if m:
             try: gross = _scale(float(m.group(1).replace(",","")), m.group(2))
             except: pass
 
-    # 3. Shares at price — derive gross and/or price
+    # 3. Shares at price — only if price is a plausible per-share price (<$1000)
     m2 = _SHARES_RE.search(text)
     if m2:
         try:
             shares = _scale(float(m2.group(1).replace(",","")), m2.group(2))
             px     = float(m2.group(3).replace(",",""))
-            # Only use share-derived gross if we don't already have one
-            # and share count looks reasonable (not 100B+)
-            if gross is None and shares < 1e11:
-                gross = shares * px
-            price = px
+            if px < 1000:  # sanity: per-share price
+                if gross is None and shares < 1e10:
+                    gross = shares * px
+                price = px
         except: pass
 
     # 4. Explicit price only
@@ -225,16 +224,23 @@ def parse_offering_size(text):
             try: price = float(m3.group(1).replace(",",""))
             except: pass
 
+    # Sanity check: gross must be >= $10K and if mkt_cap known, <= 50x mkt_cap
+    if gross is not None:
+        if gross < 10_000:
+            gross = None
+        elif mkt_cap and gross > mkt_cap * 50:
+            gross = None  # almost certainly a share count parsed as dollars
+
     parts = []
-    if gross and gross >= 1000:   # ignore tiny noise values
+    if gross:
         parts.append(f"${fmt_num(gross, d=1)}")
-    if price and price < 10000:   # ignore absurd prices
-        parts.append(f"@ ${price:.2f}/sh")
+    if price and 0.0001 < price < 100_000:
+        parts.append(f"@ ${price:.4f}/sh" if price < 0.01 else f"@ ${price:.2f}/sh")
     return "  ".join(parts) if parts else ""
 
 # ── Dilution detectors ────────────────────────────────────────────────────────
 
-async def detect_atm(s, cik_raw):
+async def detect_atm(s, cik_raw, mkt_cap=None):
     cik_i = int(cik_raw.lstrip("0") or "0")
     filings = await get_filings(s, cik_raw, {"S-3", "S-3/A", "424B3", "424B4"}, 5)
     for f in filings:
@@ -245,12 +251,12 @@ async def detect_atm(s, cik_raw):
         for pat in ATM_PATTERNS:
             m = pat.search(text)
             if m:
-                size = parse_offering_size(text)
+                size = parse_offering_size(text, mkt_cap)
                 return {"active": True, "form": f["form"], "date": f["date"],
                         "evidence": snippet(text, m)[:120], "size": size}
     return {"active": False}
 
-async def detect_shelf(s, cik_raw):
+async def detect_shelf(s, cik_raw, mkt_cap=None):
     """Check for a live S-3 shelf (filed in last 3 years, which is the SEC effective window)."""
     cik_i = int(cik_raw.lstrip("0") or "0")
     filings = await get_filings(s, cik_raw, {"S-3", "S-3/A"}, 3)
@@ -261,11 +267,11 @@ async def detect_shelf(s, cik_raw):
             if f.get("doc"):
                 acc = f["acc"].replace("-", "")
                 text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}")
-                if text: size = parse_offering_size(text)
+                if text: size = parse_offering_size(text, mkt_cap)
             return {"active": True, "form": f["form"], "date": f["date"], "size": size}
     return {"active": False}
 
-async def detect_pipe_rd(s, cik_raw):
+async def detect_pipe_rd(s, cik_raw, mkt_cap=None):
     """Scan recent S-1 / 424B3 filings for PIPE or registered direct language."""
     cik_i = int(cik_raw.lstrip("0") or "0")
     filings = await get_filings(s, cik_raw, {"S-1", "S-1/A", "424B3", "424B4"}, 5)
@@ -278,14 +284,14 @@ async def detect_pipe_rd(s, cik_raw):
         for pat in PIPE_PATTERNS:
             m = pat.search(text)
             if m:
-                size = parse_offering_size(text)
+                size = parse_offering_size(text, mkt_cap)
                 label = m.group(0).strip()
                 if size: label = f"{label} — {size}"
                 hits.append({"form": f["form"], "date": f["date"], "label": label[:60]})
                 break
     return hits
 
-async def detect_8k_offerings(s, cik_raw):
+async def detect_8k_offerings(s, cik_raw, mkt_cap=None):
     """Scan recent 8-Ks for dilutive offering announcements."""
     cik_i = int(cik_raw.lstrip("0") or "0")
     filings = await get_filings(s, cik_raw, {"8-K", "8-K/A"}, 8)
@@ -298,7 +304,7 @@ async def detect_8k_offerings(s, cik_raw):
         for pat in OFFERING_8K_PATTERNS:
             m = pat.search(text)
             if m:
-                size = parse_offering_size(text)
+                size = parse_offering_size(text, mkt_cap)
                 label = m.group(0).strip()
                 if size: label = f"{label} — {size}"
                 hits.append({"date": f["date"], "label": label[:70]})
@@ -306,7 +312,7 @@ async def detect_8k_offerings(s, cik_raw):
         if len(hits) >= 3: break
     return hits
 
-async def detect_warrants(s, cik_raw):
+async def detect_warrants(s, cik_raw, mkt_cap=None):
     """Check most recent S-1/424B for warrant mentions."""
     cik_i = int(cik_raw.lstrip("0") or "0")
     filings = await get_filings(s, cik_raw, {"424B3", "424B4", "S-1", "S-1/A"}, 3)
@@ -318,7 +324,7 @@ async def detect_warrants(s, cik_raw):
         for pat in WARRANT_PATTERNS:
             m = pat.search(text)
             if m:
-                size = parse_offering_size(text)
+                size = parse_offering_size(text, mkt_cap)
                 return {"found": True, "form": f["form"], "date": f["date"],
                         "ctx": snippet(text, m, before=0, after=80, maxlen=100), "size": size}
     return {"found": False}
@@ -383,11 +389,11 @@ async def build_embed(ticker):
         if cik:
             (atm, shelf, pipe_rd, offerings_8k,
              warrants, rsplits, maj) = await asyncio.gather(
-                detect_atm(s, cik),
-                detect_shelf(s, cik),
-                detect_pipe_rd(s, cik),
-                detect_8k_offerings(s, cik),
-                detect_warrants(s, cik),
+                detect_atm(s, cik, mkt_cap=det.get('market_cap')),
+                detect_shelf(s, cik, mkt_cap=det.get('market_cap')),
+                detect_pipe_rd(s, cik, mkt_cap=det.get('market_cap')),
+                detect_8k_offerings(s, cik, mkt_cap=det.get('market_cap')),
+                detect_warrants(s, cik, mkt_cap=det.get('market_cap')),
                 detect_reverse_split(s, cik),
                 detect_majority(s, cik))
 
