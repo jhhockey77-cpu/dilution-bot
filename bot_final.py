@@ -1,5 +1,6 @@
 import os, re, asyncio, aiohttp, discord
 from datetime import datetime, timedelta
+from html import unescape
 
 POLYGON_KEY   = "0NCwDp9jz7LfO6C0y0y4tKPRLvmH5mX1"
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
@@ -49,10 +50,13 @@ RSPLIT_PATTERNS = [
     re.compile(r'(\d+)-for-(\d+)\s+reverse', re.I),
 ]
 
+# Majority ownership — require explicit share ownership context, not board/independence %
 MAJORITY_PATTERNS = [
-    re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%.*?(?:beneficially own|beneficial owner)', re.I),
     re.compile(r'beneficially own[s]?\s+(\d{1,3}(?:\.\d+)?)\s*%', re.I),
-    re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:outstanding|issued)', re.I),
+    re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%.*?beneficially own', re.I),
+    re.compile(r'beneficial owner[ship]*\s+of\s+(\d{1,3}(?:\.\d+)?)\s*%', re.I),
+    re.compile(r'owns\s+(\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:outstanding|issued|common)', re.I),
+    re.compile(r'(\d{1,3}(?:\.\d+)?)\s*%\s+of\s+(?:the\s+)?(?:outstanding|issued)\s+(?:shares|common)', re.I),
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -144,7 +148,8 @@ async def edgar_text(s, url, mb=60000):
             if r.status != 200: return ""
             raw = await r.content.read(mb)
             text = raw.decode("utf-8", errors="ignore")
-            text = re.sub(r'<[^>]+>', ' ', text)
+            text = re.sub(r'<[^>]+>', ' ', text)  # strip HTML tags
+            text = unescape(text)                  # decode &amp; &#160; etc.
             return re.sub(r'\s+', ' ', text)
     except: return ""
 
