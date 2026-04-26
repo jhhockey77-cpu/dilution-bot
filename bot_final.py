@@ -245,17 +245,24 @@ async def detect_atm(s, cik_raw):
         for pat in ATM_PATTERNS:
             m = pat.search(text)
             if m:
+                size = parse_offering_size(text)
                 return {"active": True, "form": f["form"], "date": f["date"],
-                        "evidence": snippet(text, m)[:120]}
+                        "evidence": snippet(text, m)[:120], "size": size}
     return {"active": False}
 
 async def detect_shelf(s, cik_raw):
     """Check for a live S-3 shelf (filed in last 3 years, which is the SEC effective window)."""
+    cik_i = int(cik_raw.lstrip("0") or "0")
     filings = await get_filings(s, cik_raw, {"S-3", "S-3/A"}, 3)
     cutoff = (datetime.utcnow() - timedelta(days=3*365)).strftime("%Y-%m-%d")
     for f in filings:
         if f["date"] >= cutoff:
-            return {"active": True, "form": f["form"], "date": f["date"]}
+            size = ""
+            if f.get("doc"):
+                acc = f["acc"].replace("-", "")
+                text = await edgar_text(s, f"https://www.sec.gov/Archives/edgar/data/{cik_i}/{acc}/{f['doc']}")
+                if text: size = parse_offering_size(text)
+            return {"active": True, "form": f["form"], "date": f["date"], "size": size}
     return {"active": False}
 
 async def detect_pipe_rd(s, cik_raw):
@@ -311,8 +318,9 @@ async def detect_warrants(s, cik_raw):
         for pat in WARRANT_PATTERNS:
             m = pat.search(text)
             if m:
+                size = parse_offering_size(text)
                 return {"found": True, "form": f["form"], "date": f["date"],
-                        "ctx": snippet(text, m, before=0, after=80, maxlen=100)}
+                        "ctx": snippet(text, m, before=0, after=80, maxlen=100), "size": size}
     return {"found": False}
 
 async def detect_reverse_split(s, cik_raw):
@@ -411,13 +419,15 @@ async def build_embed(ticker):
 
     # ATM
     if atm_on:
-        dil_lines.append(f"🔴 **Active ATM** — `{atm['form']}` {atm['date']}\n> {atm.get('evidence','')[:100]}...")
+        atm_sz = f"  {atm['size']}" if atm.get('size') else ""
+        dil_lines.append(f"🔴 **Active ATM**{atm_sz} — `{atm['form']}` {atm['date']}\n> {atm.get('evidence','')[:100]}...")
     else:
         dil_lines.append("🟢 No active ATM")
 
     # Live shelf
     if shelf.get("active"):
-        dil_lines.append(f"🔴 **Live S-3 Shelf** — filed {shelf['date']} (within 3yr window)")
+        shelf_sz = f"  {shelf['size']}" if shelf.get('size') else ""
+        dil_lines.append(f"🔴 **Live S-3 Shelf**{shelf_sz} — filed {shelf['date']}")
     else:
         dil_lines.append("🟢 No active shelf registration")
 
@@ -431,11 +441,12 @@ async def build_embed(ticker):
     # 8-K offerings
     if offerings_8k:
         for o in offerings_8k[:2]:
-            dil_lines.append(f"🟠 **8-K offering** {o['date']} — {o['label'].strip()}")
+            dil_lines.append(f"🟠 **8-K** {o['date']} — {o['label'].strip()}")
 
     # Warrants
     if warrants.get("found"):
-        dil_lines.append(f"🟠 **Warrants outstanding** — `{warrants['form']}` {warrants['date']}\n> {warrants.get('ctx','')[:80]}")
+        w_sz = f"  {warrants['size']}" if warrants.get('size') else ""
+        dil_lines.append(f"🟠 **Warrants outstanding**{w_sz} — `{warrants['form']}` {warrants['date']}")
     else:
         dil_lines.append("🟢 No warrant overhang detected")
 
