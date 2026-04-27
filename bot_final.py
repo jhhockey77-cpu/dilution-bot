@@ -25,6 +25,7 @@ from html import unescape
 POLYGON_KEY   = "0NCwDp9jz7LfO6C0y0y4tKPRLvmH5mX1"
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 GUILD_ID      = 1497766198904094770
+GENERAL_CHANNEL_ID = 1497766199713464502  # only respond to ticker mentions in #general
 TICKER_RE     = re.compile(r'\$([A-Za-z]{1,5})\b')
 SEC_HEADERS   = {"User-Agent": "DilutionBot jh.hockey77@gmail.com",
                  "Accept-Encoding": "gzip, deflate"}
@@ -805,6 +806,7 @@ async def on_ready():
 async def on_message(msg: discord.Message):
     if msg.author == client.user: return
     if msg.guild and msg.guild.id != GUILD_ID: return
+    if msg.channel.id != GENERAL_CHANNEL_ID: return
     tickers = list(dict.fromkeys(t.upper() for t in TICKER_RE.findall(msg.content)))
     if not tickers: return
     for ticker in tickers[:2]:
