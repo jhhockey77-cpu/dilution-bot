@@ -104,6 +104,30 @@ WARRANT_PATTERNS = [
     re.compile(r'warrant[s]?\s+to\s+purchase\s+(?:up\s+to\s+)?(?:[\d,]+|an\s+aggregate)', re.I),
     re.compile(r'([\d,]+(?:\.\d+)?)\s+warrant[s]?\s+(?:exercisable|outstanding)', re.I),
 ]
+
+# Patterns to extract warrant SHARE COUNT (how many underlying shares)
+WARRANT_SHARES_PATTERNS = [
+    # "warrants to purchase up to 1,234,567 shares"
+    re.compile(r'warrant[s]?\s+to\s+purchase\s+(?:up\s+to\s+)?(?:an\s+aggregate\s+of\s+)?([\d,]+)\s+shares', re.I),
+    # "1,234,567 warrants ... exercisable"
+    re.compile(r'([\d,]{4,})\s+(?:common\s+|pre[\s\-]funded\s+|series\s+\w+\s+)?warrant[s]?\s+(?:to\s+purchase|exercisable|outstanding)', re.I),
+    # "warrants exercisable for an aggregate of 1,234,567 shares"
+    re.compile(r'warrant[s]?\s+exercisable\s+for\s+(?:an\s+aggregate\s+of\s+)?([\d,]+)\s+shares', re.I),
+    # "warrants representing the right to purchase 1,234,567 shares"
+    re.compile(r'warrant[s]?\s+representing\s+the\s+right\s+to\s+purchase\s+([\d,]+)\s+shares', re.I),
+]
+
+# Patterns to extract warrant EXERCISE PRICE
+WARRANT_PRICE_PATTERNS = [
+    # "exercise price of $X.XX per share"
+    re.compile(r'exercise\s+price\s+of\s+\$?\s*([\d]+(?:\.\d+)?)\s*(?:per\s+share)?', re.I),
+    # "at an exercise price equal to $X.XX"
+    re.compile(r'exercise\s+price\s+(?:equal\s+to\s+|of\s+)?\$?\s*([\d]+(?:\.\d+)?)', re.I),
+    # "exercisable at $X.XX per share"
+    re.compile(r'exercisable\s+at\s+(?:a\s+price\s+of\s+)?\$?\s*([\d]+(?:\.\d+)?)', re.I),
+    # "$X.XX per share exercise price"
+    re.compile(r'\$\s*([\d]+(?:\.\d+)?)\s+(?:per\s+share\s+)?exercise\s+price', re.I),
+]
 WARRANT_NEGATION_PATTERNS = [
     re.compile(r'no\s+warrants?\s+(?:are\s+)?(?:outstanding|exercisable|issued)', re.I),
     re.compile(r'we\s+(?:do\s+not\s+have|have\s+no)\s+(?:any\s+)?warrants', re.I),
@@ -568,8 +592,53 @@ async def detect_8k_offerings(s, cik_raw, submissions, mkt_cap=None):
     return hits
 
 
+def _extract_warrant_details(text, match):
+    """Given a warrant detection match, look in a window around it for share count and exercise price."""
+    # Search in a 1500-char window centered on the match — exercise price
+    # and share count are typically discussed in the same paragraph.
+    start = max(0, match.start() - 600)
+    end   = min(len(text), match.end() + 900)
+    window = text[start:end]
+
+    shares = None
+    for pat in WARRANT_SHARES_PATTERNS:
+        sm = pat.search(window)
+        if sm:
+            try:
+                n = int(sm.group(1).replace(",", ""))
+                # sanity: between 1k and 5B underlying shares
+                if 1000 <= n <= 5_000_000_000:
+                    shares = n
+                    break
+            except (ValueError, IndexError):
+                pass
+
+    price = None
+    for pat in WARRANT_PRICE_PATTERNS:
+        pm = pat.search(window)
+        if pm:
+            try:
+                p = float(pm.group(1))
+                # sanity: between $0.01 and $10,000
+                if 0.01 <= p <= 10_000:
+                    price = p
+                    break
+            except (ValueError, IndexError):
+                pass
+
+    return shares, price
+
+
+def _fmt_shares(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.0f}K"
+    return f"{n:,}"
+
+
 async def detect_warrants(s, cik_raw, submissions, mkt_cap=None):
-    """Warrants outstanding — guard against negation."""
+    """Warrants outstanding — guard against negation. Extract share count + exercise price."""
     cutoff = (datetime.utcnow() - timedelta(days=540)).strftime("%Y-%m-%d")
     filings = list(_iter_filings(submissions, WARRANT_FORMS, n=4, since_date=cutoff))
     for f in filings:
@@ -580,8 +649,10 @@ async def detect_warrants(s, cik_raw, submissions, mkt_cap=None):
             if not m: continue
             if _has_warrant_negation(text, m): continue
             size = parse_offering_size(text, mkt_cap)
+            shares, price = _extract_warrant_details(text, m)
             return {"found": True, "form": f["form"], "date": f["date"],
-                    "ctx": snippet(text, m, before=0, after=80, maxlen=100), "size": size}
+                    "ctx": snippet(text, m, before=0, after=80, maxlen=100),
+                    "size": size, "shares": shares, "exercise_price": price}
     return {"found": False}
 
 
@@ -739,8 +810,15 @@ async def build_embed(ticker):
             dil_lines.append(f"🟠 **8-K** {o['date']} — {o['label'].strip()}")
 
     if warrants.get("found"):
-        sz = f"  {warrants['size']}" if warrants.get('size') else ""
-        dil_lines.append(f"🟠 **Warrants outstanding**{sz} — `{warrants['form']}` {warrants['date']}")
+        parts = []
+        if warrants.get("shares"):
+            parts.append(f"{_fmt_shares(warrants['shares'])} shares")
+        if warrants.get("exercise_price") is not None:
+            parts.append(f"@ ${warrants['exercise_price']:.2f}")
+        if warrants.get("size"):
+            parts.append(f"({warrants['size']})")
+        detail = (" " + " ".join(parts)) if parts else ""
+        dil_lines.append(f"🟠 **Warrants outstanding**{detail} — `{warrants['form']}` {warrants['date']}")
     else:
         dil_lines.append("🟢 No warrant overhang detected")
 
