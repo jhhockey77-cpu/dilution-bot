@@ -105,26 +105,32 @@ WARRANT_PATTERNS = [
     re.compile(r'([\d,]+(?:\.\d+)?)\s+warrant[s]?\s+(?:exercisable|outstanding)', re.I),
 ]
 
-# Patterns to extract warrant SHARE COUNT (how many underlying shares)
+# Patterns to extract warrant SHARE COUNT (how many underlying shares).
+# Each match must capture the share number in group 1. We'll sum across
+# multiple matches to handle multi-tranche offerings (Series A + B + Pre-Funded).
 WARRANT_SHARES_PATTERNS = [
+    # "107,142,857 Class A Shares Underlying the Series A Warrants"
+    re.compile(r'([\d,]{4,})\s+(?:Class\s+\w+\s+|Common\s+|Ordinary\s+)?[Ss]hares\s+(?:[Uu]nderlying|[Ii]ssuable\s+upon\s+(?:the\s+)?exercise\s+of)\s+(?:the\s+)?(?:Series\s+\w+\s+|Pre[\s\-]?[Ff]unded\s+|Common\s+)?[Ww]arrant', re.I),
     # "warrants to purchase up to 1,234,567 shares"
-    re.compile(r'warrant[s]?\s+to\s+purchase\s+(?:up\s+to\s+)?(?:an\s+aggregate\s+of\s+)?([\d,]+)\s+shares', re.I),
-    # "1,234,567 warrants ... exercisable"
-    re.compile(r'([\d,]{4,})\s+(?:common\s+|pre[\s\-]funded\s+|series\s+\w+\s+)?warrant[s]?\s+(?:to\s+purchase|exercisable|outstanding)', re.I),
+    re.compile(r'[Ww]arrant[s]?\s+to\s+purchase\s+(?:up\s+to\s+)?(?:an\s+aggregate\s+of\s+)?([\d,]{4,})\s+(?:Class\s+\w+\s+)?(?:[Oo]rdinary\s+|[Cc]ommon\s+)?[Ss]hares', re.I),
     # "warrants exercisable for an aggregate of 1,234,567 shares"
-    re.compile(r'warrant[s]?\s+exercisable\s+for\s+(?:an\s+aggregate\s+of\s+)?([\d,]+)\s+shares', re.I),
+    re.compile(r'[Ww]arrant[s]?\s+exercisable\s+(?:for\s+|to\s+purchase\s+)?(?:an\s+aggregate\s+of\s+)?([\d,]{4,})\s+(?:Class\s+\w+\s+)?(?:[Oo]rdinary\s+|[Cc]ommon\s+)?[Ss]hares', re.I),
     # "warrants representing the right to purchase 1,234,567 shares"
-    re.compile(r'warrant[s]?\s+representing\s+the\s+right\s+to\s+purchase\s+([\d,]+)\s+shares', re.I),
+    re.compile(r'[Ww]arrant[s]?\s+representing\s+the\s+right\s+to\s+purchase\s+([\d,]{4,})\s+[Ss]hares', re.I),
+    # "a maximum of 214,285,714 Class A Shares issuable upon exercise of the Warrants"
+    re.compile(r'(?:maximum\s+of\s+|aggregate\s+of\s+)([\d,]{4,})\s+(?:Class\s+\w+\s+)?(?:[Oo]rdinary\s+|[Cc]ommon\s+)?[Ss]hares\s+issuable\s+upon\s+(?:the\s+)?exercise\s+of\s+(?:the\s+)?[Ww]arrant', re.I),
 ]
 
 # Patterns to extract warrant EXERCISE PRICE
 WARRANT_PRICE_PATTERNS = [
     # "exercise price of $X.XX per share"
     re.compile(r'exercise\s+price\s+of\s+\$?\s*([\d]+(?:\.\d+)?)\s*(?:per\s+share)?', re.I),
+    # "exercisable at an exercise price of $X.XX"
+    re.compile(r'exercisable\s+at\s+an\s+exercise\s+price\s+(?:equal\s+to\s+|of\s+)?\$?\s*([\d]+(?:\.\d+)?)', re.I),
     # "at an exercise price equal to $X.XX"
     re.compile(r'exercise\s+price\s+(?:equal\s+to\s+|of\s+)?\$?\s*([\d]+(?:\.\d+)?)', re.I),
     # "exercisable at $X.XX per share"
-    re.compile(r'exercisable\s+at\s+(?:a\s+price\s+of\s+)?\$?\s*([\d]+(?:\.\d+)?)', re.I),
+    re.compile(r'exercisable\s+at\s+(?:a\s+price\s+of\s+)?\$?\s*([\d]+(?:\.\d+)?)\s+per\s+share', re.I),
     # "$X.XX per share exercise price"
     re.compile(r'\$\s*([\d]+(?:\.\d+)?)\s+(?:per\s+share\s+)?exercise\s+price', re.I),
 ]
@@ -593,40 +599,76 @@ async def detect_8k_offerings(s, cik_raw, submissions, mkt_cap=None):
 
 
 def _extract_warrant_details(text, match):
-    """Given a warrant detection match, look in a window around it for share count and exercise price."""
-    # Search in a 1500-char window centered on the match — exercise price
-    # and share count are typically discussed in the same paragraph.
-    start = max(0, match.start() - 600)
-    end   = min(len(text), match.end() + 900)
+    """Given a warrant detection match, look in a window around it for share count and exercise price.
+    Sums multi-tranche warrants (Series A + B + Pre-Funded). Captures exercise price range."""
+    # Search in a wide window — prospectus warrant details span 2k+ chars.
+    start = max(0, match.start() - 1000)
+    end   = min(len(text), match.end() + 3000)
     window = text[start:end]
 
-    shares = None
+    # Collect all unique share-count hits across all patterns.
+    share_hits = set()
     for pat in WARRANT_SHARES_PATTERNS:
-        sm = pat.search(window)
-        if sm:
+        for sm in pat.finditer(window):
             try:
                 n = int(sm.group(1).replace(",", ""))
-                # sanity: between 1k and 5B underlying shares
                 if 1000 <= n <= 5_000_000_000:
-                    shares = n
-                    break
+                    share_hits.add(n)
             except (ValueError, IndexError):
-                pass
+                continue
 
-    price = None
+    # Collect all unique exercise-price hits.
+    price_hits = []
+    seen_prices = set()
     for pat in WARRANT_PRICE_PATTERNS:
-        pm = pat.search(window)
-        if pm:
+        for pm in pat.finditer(window):
             try:
                 p = float(pm.group(1))
-                # sanity: between $0.01 and $10,000
-                if 0.01 <= p <= 10_000:
-                    price = p
-                    break
+                if 0.0001 <= p <= 10_000 and p not in seen_prices:
+                    price_hits.append(p)
+                    seen_prices.add(p)
             except (ValueError, IndexError):
-                pass
+                continue
 
-    return shares, price
+    # For shares: dedupe "summary" totals from individual tranche numbers.
+    # Filings often state the aggregate (e.g. "maximum of 214,285,714 shares")
+    # alongside per-tranche numbers (107M Series A + 85M Series B + 21M pre-funded).
+    # Strategy: if the largest hit equals the sum of any subset of the smaller hits
+    # (within 10% tolerance), trust the largest as the aggregate. Otherwise sum.
+    shares = None
+    if share_hits:
+        sorted_hits = sorted(share_hits, reverse=True)
+        largest = sorted_hits[0]
+        smaller = sorted_hits[1:]
+
+        def _is_subset_sum(target, items, tol=0.10):
+            # Check if any subset of items sums to ~target.
+            from itertools import combinations
+            for r in range(1, min(len(items), 5) + 1):
+                for combo in combinations(items, r):
+                    s = sum(combo)
+                    if s > 0 and abs(s - target) / target < tol:
+                        return True
+            return False
+
+        if smaller and _is_subset_sum(largest, smaller):
+            # Largest is the aggregate — use it directly.
+            shares = largest
+        else:
+            # Distinct tranches — sum up to 4.
+            shares = sum(sorted_hits[:4])
+
+    # For price: ignore obvious pre-funded penny prices ($0.0001) when reporting
+    # the headline price unless they're the only ones.
+    real_prices = [p for p in price_hits if p >= 0.05]
+    if real_prices:
+        price_min, price_max = min(real_prices), max(real_prices)
+    elif price_hits:
+        price_min = price_max = price_hits[0]
+    else:
+        price_min = price_max = None
+
+    return shares, price_min, price_max
 
 
 def _fmt_shares(n):
@@ -649,10 +691,11 @@ async def detect_warrants(s, cik_raw, submissions, mkt_cap=None):
             if not m: continue
             if _has_warrant_negation(text, m): continue
             size = parse_offering_size(text, mkt_cap)
-            shares, price = _extract_warrant_details(text, m)
+            shares, price_min, price_max = _extract_warrant_details(text, m)
             return {"found": True, "form": f["form"], "date": f["date"],
                     "ctx": snippet(text, m, before=0, after=80, maxlen=100),
-                    "size": size, "shares": shares, "exercise_price": price}
+                    "size": size, "shares": shares,
+                    "price_min": price_min, "price_max": price_max}
     return {"found": False}
 
 
@@ -813,8 +856,14 @@ async def build_embed(ticker):
         parts = []
         if warrants.get("shares"):
             parts.append(f"{_fmt_shares(warrants['shares'])} shares")
-        if warrants.get("exercise_price") is not None:
-            parts.append(f"@ ${warrants['exercise_price']:.2f}")
+        pmin, pmax = warrants.get("price_min"), warrants.get("price_max")
+        if pmin is not None:
+            if pmax is not None and pmax != pmin:
+                parts.append(f"@ ${pmin:.4f}–${pmax:.4f}".replace(".0000", ".00"))
+            else:
+                # smart format: 2 decimals if >= $0.10, else more precision
+                fmt = f"${pmin:.2f}" if pmin >= 0.10 else f"${pmin:.4f}"
+                parts.append(f"@ {fmt}")
         if warrants.get("size"):
             parts.append(f"({warrants['size']})")
         detail = (" " + " ".join(parts)) if parts else ""
