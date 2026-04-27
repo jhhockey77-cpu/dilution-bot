@@ -172,17 +172,28 @@ def snippet(text, match, before=60, after=100, maxlen=140):
 # SEC policy: ≤10 req/s with proper User-Agent. We rate-limit globally via a
 # single-thread-token "bucket" — every request awaits a minimum gap.
 _EDGAR_GAP = 0.12  # ~8 req/s ceiling (SEC limit is 10/s)
-_edgar_lock = asyncio.Lock()
+_edgar_lock = None  # lazy-init inside the running loop to avoid "attached to a different loop" errors
+_edgar_lock_loop = None
 _edgar_last  = 0.0
+
+def _get_edgar_lock():
+    global _edgar_lock, _edgar_lock_loop
+    loop = asyncio.get_running_loop()
+    if _edgar_lock is None or _edgar_lock_loop is not loop:
+        _edgar_lock = asyncio.Lock()
+        _edgar_lock_loop = loop
+    return _edgar_lock
 
 async def _edgar_acquire():
     global _edgar_last
-    async with _edgar_lock:
-        now = asyncio.get_event_loop().time()
+    lock = _get_edgar_lock()
+    async with lock:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
         wait = _EDGAR_GAP - (now - _edgar_last)
         if wait > 0:
             await asyncio.sleep(wait)
-        _edgar_last = asyncio.get_event_loop().time()
+        _edgar_last = loop.time()
 
 async def poly(session, url):
     try:
